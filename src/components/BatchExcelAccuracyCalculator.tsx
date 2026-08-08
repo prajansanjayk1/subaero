@@ -1,5 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import whiteboxModelsData from '../assets/whitebox_models.json';
+import whitebox12Data from '../assets/whitebox_models_12sensors.json';
 import {
   FileSpreadsheet, Upload, CheckCircle2, AlertCircle, ArrowRight,
   BarChart2, Award, Download, RefreshCw, Calculator, Table, ShieldCheck
@@ -1302,72 +1303,50 @@ function predictRow(row: TelemetryRow): {
   comp: number; comb: number; turb: number;
   overall: number; thrust: number; tsfc: number;
 } {
-  const alt   = extractVal(row, ['alt','altitude'],                  10000);
-  const mach  = extractVal(row, ['mach'],                            0.8);
-  const Tamb  = extractVal(row, ['tamb','ambienttemp'],              288.15);
-  const Pamb  = extractVal(row, ['pamb','ambientpressure'],          101325);
-  const RPM   = extractVal(row, ['rpm','shaftspeed'],                55000);
-  const FF    = extractVal(row, ['fuelflow','ff','wf'],              2.8);
-  const P2    = extractVal(row, ['p2','inletpressure'],              101325);
-  const T2    = extractVal(row, ['t2','inlettemp'],                  300);
-  const P3    = extractVal(row, ['p3','compressorexitpressure'],     3000000);
-  const T3    = extractVal(row, ['t3','compressorexittemp'],         1000);
-  const P4    = extractVal(row, ['p4','turbineexitpressure'],        2900000);
-  const T4    = extractVal(row, ['t4','turbineexittemp'],            800);
-  const cycle = extractVal(row, ['cycle'],                           15);
+  const alt   = extractVal(row, ['alt','altitude','altitude_m'],            10000);
+  const mach  = extractVal(row, ['mach'],                                  0.8);
+  const Tamb  = extractVal(row, ['tamb','ambienttemp','tamb_k'],           288.15);
+  const Pamb  = extractVal(row, ['pamb','ambientpressure','pamb_pa'],      101325);
+  const RPM   = extractVal(row, ['rpm','shaftspeed','rpm_rev_min'],        55000);
+  const FF    = extractVal(row, ['fuelflow','ff','wf','fuelflow_kg_s'],     2.8);
+  const P2    = extractVal(row, ['p2','inletpressure','p2_pa'],             101325);
+  const T2    = extractVal(row, ['t2','inlettemp','t2_k'],                 300);
+  const P3    = extractVal(row, ['p3','compressorexitpressure','p3_pa'],    3000000);
+  const T3    = extractVal(row, ['t3','compressorexittemp','t3_k'],        1000);
+  const P4    = extractVal(row, ['p4','turbineexitpressure','p4_pa'],       2900000);
+  const T4    = extractVal(row, ['t4','turbineexittemp','t4_k'],           800);
+  const cycle = extractVal(row, ['cycle'],                                 15);
 
-  const givenComp = extractVal(row, ['comphealth','compressorhealth','comp health'], -1);
-  const givenComb = extractVal(row, ['combhealth','combustorhealth','comb health'],  -1);
-  const givenTurb = extractVal(row, ['turbhealth','turbinehealth','turb health'],    -1);
-  const givenOver = extractVal(row, ['overallhealth','overall health'],              -1);
+  // 100% White-Box Direct 12-Sensor Polynomial Ridge Model Evaluation
+  const raw12 = [alt, mach, Tamb, Pamb, RPM, FF, P2, T2, P3, T3, P4, T4];
 
-  if (givenComp >= 0) {
-    const comp    = normHealth(givenComp);
-    const comb    = givenComb >= 0 ? normHealth(givenComb) : 0.85;
-    const turb    = givenTurb >= 0 ? normHealth(givenTurb) : 0.85;
-    const overall = givenOver >= 0 ? normHealth(givenOver) : 0.35 * comp + 0.30 * comb + 0.35 * turb;
-    const givenThrust = extractVal(row, ['thrust','thrust_n','thrustn','thrust (n)'], -1);
-    const thrust = givenThrust > 0 ? givenThrust : 30000 + 45000 * overall;
-    const tsfc   = Math.max(0.01, (FF * 1000) / Math.max(thrust, EPS));
-    return { comp, comb, turb, overall, thrust, tsfc };
-  }
-
-  // 100% White-Box Polynomial Ridge Model Evaluation (13 features -> 104 poly terms -> Scaler -> Ridge)
-  const raw13 = [alt, mach, Tamb, Pamb, RPM, FF, P2, T2, P3, T3, P4, T4, cycle];
-
-  const predictTarget = (targetName: string): number => {
-    const m = (whiteboxModelsData as any)[targetName];
+  const predictTarget12 = (targetName: string): number => {
+    const m = (whitebox12Data as any)[targetName];
     if (!m) return 0.85;
 
-    // 1. Impute missing values with trained median statistics
-    const xImp = raw13.map((v, i) => (isNaN(v) || v === null ? m.imputer_statistics[i] : v));
+    // 1. Z-score normalize raw 12 sensors
+    const z = raw12.map((v, i) => (v - m.mean[i]) / (m.scale[i] || 1.0));
 
-    // 2. Polynomial Feature Expansion (104 features: 13 linear + 91 quadratic)
-    const polyFeats: number[] = [];
-    for (let i = 0; i < 13; i++) polyFeats.push(xImp[i]);
-    for (let i = 0; i < 13; i++) {
-      for (let j = i; j < 13; j++) {
-        polyFeats.push(xImp[i] * xImp[j]);
-      }
-    }
-
-    // 3. RobustScaler + Linear Combination of Ridge Weights
+    // 2. Evaluate 91 polynomial feature terms via explicit powers matrix
     let dot = m.intercept;
-    for (let k = 0; k < polyFeats.length; k++) {
-      const center = m.scaler_center[k] || 0.0;
-      const scale = m.scaler_scale[k] || 1.0;
-      const scaled = (polyFeats[k] - center) / (scale === 0 ? 1.0 : scale);
-      dot += scaled * m.coefficients[k];
+    for (let k = 0; k < m.powers.length; k++) {
+      let term = 1.0;
+      const p = m.powers[k];
+      for (let i = 0; i < 12; i++) {
+        if (p[i] === 1) term *= z[i];
+        else if (p[i] === 2) term *= z[i] * z[i];
+      }
+      dot += term * m.coef[k];
     }
     return dot;
   };
 
-  const comp    = Math.min(0.9999, Math.max(0.10, predictTarget('CompressorHealth')));
-  const comb    = Math.min(0.9999, Math.max(0.10, predictTarget('CombustorHealth')));
-  const turb    = Math.min(0.9999, Math.max(0.10, predictTarget('TurbineHealth')));
-  const overall = Math.min(0.9999, Math.max(0.10, predictTarget('OverallHealth')));
-  const thrust  = Math.max(5000, predictTarget('Thrust_N'));
-  const tsfc    = Math.max(0.001, predictTarget('TSFC_g_N_s'));
+  const comp    = Math.min(0.9999, Math.max(0.10, predictTarget12('CompressorHealth')));
+  const comb    = Math.min(0.9999, Math.max(0.10, predictTarget12('CombustorHealth')));
+  const turb    = Math.min(0.9999, Math.max(0.10, predictTarget12('TurbineHealth')));
+  const overall = Math.min(0.9999, Math.max(0.10, predictTarget12('OverallHealth')));
+  const thrust  = Math.max(5000, predictTarget12('Thrust_N'));
+  const tsfc    = Math.max(0.001, predictTarget12('TSFC_g_N_s'));
 
   return { comp, comb, turb, overall, thrust, tsfc };
 }
